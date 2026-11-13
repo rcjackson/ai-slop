@@ -98,7 +98,8 @@ def is_vdisquants_pair(
             f"{name} {value}"
             for name, value in dataset_metadata.get("global_attributes", {}).items()
         )
-    return "vdisquants" in " ".join(identifying_text).casefold()
+    product_text = " ".join(identifying_text).casefold()
+    return "vdisquants" in product_text or "ldquants" in product_text
 
 
 def is_vdisquants_moment(name: str, left_variable: Any, right_variable: Any) -> bool:
@@ -216,6 +217,7 @@ def compare_values(
     rtol: float,
     max_differences: int,
     max_scatter_points: int | None = None,
+    machine_epsilon: bool = False,
 ) -> dict[str, Any]:
     left = np.ma.asarray(left_variable[...])
     right = np.ma.asarray(right_variable[...])
@@ -261,8 +263,22 @@ def compare_values(
             left_flat, right_flat, valid, max_scatter_points
         )
     if numeric:
+        comparison_atol = atol
+        comparison_rtol = rtol
+        if machine_epsilon:
+            comparison_dtype = np.result_type(left_data.dtype, right_data.dtype)
+            if np.issubdtype(comparison_dtype, np.floating):
+                epsilon = np.finfo(comparison_dtype).eps
+                comparison_atol += epsilon
+                comparison_rtol += epsilon
         try:
-            equal = np.isclose(left_flat, right_flat, atol=atol, rtol=rtol, equal_nan=True)
+            equal = np.isclose(
+                left_flat,
+                right_flat,
+                atol=comparison_atol,
+                rtol=comparison_rtol,
+                equal_nan=True,
+            )
         except (TypeError, ValueError):
             equal = left_flat == right_flat
     else:
@@ -347,6 +363,7 @@ def compare_variable(
     rtol: float,
     max_differences: int,
     max_scatter_points: int | None = None,
+    machine_epsilon: bool = False,
 ) -> dict[str, Any]:
     left_exists = name in left_dataset.variables
     right_exists = name in right_dataset.variables
@@ -369,6 +386,7 @@ def compare_variable(
             rtol,
             max_differences,
             max_scatter_points=max_scatter_points,
+            machine_epsilon=machine_epsilon,
         )
         attribute_changes = compare_attributes(
             result["left"]["attributes"], result["right"]["attributes"]
@@ -400,6 +418,7 @@ def compare_pair(
     max_differences: int,
     max_scatter_points: int = 2000,
     common_variables_only: bool = False,
+    machine_epsilon: bool = False,
 ) -> dict[str, Any]:
     pair: dict[str, Any] = {
         "relative_path": relative_path,
@@ -441,6 +460,7 @@ def compare_pair(
                         )
                         else None
                     ),
+                    machine_epsilon=machine_epsilon,
                 )
                 for name in sorted(variable_names)
             ]
@@ -449,6 +469,7 @@ def compare_pair(
                 right_format=right_dataset.data_model,
                 vdisquants=vdisquants,
                 common_variables_only=common_variables_only,
+                machine_epsilon=machine_epsilon,
                 left_metadata=left_meta,
                 right_metadata=right_meta,
                 dimension_changes=(
@@ -486,10 +507,10 @@ def find_netcdf_files(directory: Path) -> dict[str, Path]:
     return found
 
 
-def find_netcdf_files_by_date(directory: Path) -> dict[str, Path]:
+def index_netcdf_files_by_date(files: dict[str, Path], directory: Path) -> dict[str, Path]:
     """Index files by their first YYYYMMDD token, rejecting ambiguous days."""
     found: dict[str, Path] = {}
-    for relative_path, path in find_netcdf_files(directory).items():
+    for relative_path, path in files.items():
         match = re.search(r"(?<!\d)(\d{8})(?!\d)", relative_path)
         if not match:
             continue
@@ -501,6 +522,42 @@ def find_netcdf_files_by_date(directory: Path) -> dict[str, Path]:
             )
         found[date] = path
     return found
+
+
+def find_netcdf_files_by_date(directory: Path) -> dict[str, Path]:
+    return index_netcdf_files_by_date(find_netcdf_files(directory), directory)
+
+
+def filter_files_by_name(files: dict[str, Path], text: str | None) -> dict[str, Path]:
+    """Keep files whose relative path contains the requested text."""
+    if text is None:
+        return files
+    needle = text.casefold()
+    return {name: path for name, path in files.items() if needle in name.casefold()}
+
+
+def filter_files_by_date(
+    files: dict[str, Path],
+    start_date: dt.date | None,
+    end_date: dt.date | None,
+    excluded_dates: set[dt.date] | None = None,
+) -> dict[str, Path]:
+    """Keep files whose first YYYYMMDD token falls within the inclusive range."""
+    if start_date is None and end_date is None and not excluded_dates:
+        return files
+    filtered: dict[str, Path] = {}
+    for key, path in files.items():
+        match = re.search(r"(?<!\d)(\d{8})(?!\d)", key)
+        if not match:
+            continue
+        file_date = dt.datetime.strptime(match.group(1), "%Y%m%d").date()
+        if file_date in (excluded_dates or set()):
+            continue
+        if (start_date is None or file_date >= start_date) and (
+            end_date is None or file_date <= end_date
+        ):
+            filtered[key] = path
+    return filtered
 
 
 def badge(status: str) -> str:
@@ -795,6 +852,10 @@ def render_report(
     rtol: float,
     match_by_date: bool = False,
     common_variables_only: bool = False,
+    start_date: dt.date | None = None,
+    end_date: dt.date | None = None,
+    excluded_dates: list[dt.date] | None = None,
+    machine_epsilon: bool = False,
 ) -> str:
     matched = len(pairs)
     different = sum(pair["status"] == "different" for pair in pairs)
@@ -815,6 +876,24 @@ def render_report(
     variable_note = (
         "Only variables present in both files are included. "
         if common_variables_only
+        else ""
+    )
+    if start_date and end_date:
+        range_note = f"Requested date range: {start_date.isoformat()} through {end_date.isoformat()}. "
+    elif start_date:
+        range_note = f"Requested date range begins {start_date.isoformat()}. "
+    elif end_date:
+        range_note = f"Requested date range ends {end_date.isoformat()}. "
+    else:
+        range_note = ""
+    exclusion_note = (
+        "Excluded dates: " + ", ".join(date.isoformat() for date in sorted(excluded_dates or [])) + ". "
+        if excluded_dates
+        else ""
+    )
+    epsilon_note = (
+        "Numeric equality includes one dtype-scaled machine epsilon. "
+        if machine_epsilon
         else ""
     )
     return f"""<!doctype html>
@@ -838,7 +917,7 @@ main {{ max-width:1280px; margin:0 auto; padding:32px 22px 64px; }} h1 {{ margin
 </head>
 <body><main>
 <h1>NetCDF directory comparison</h1>
-<p class="lede">{pairing_note}{variable_note}Numeric values use atol={atol:g} and rtol={rtol:g}; NaN values in the same positions are treated as equal. Vdisquants moment fields include scatter plots and RMSE/R² from paired finite values.</p>
+<p class="lede">{pairing_note}{range_note}{exclusion_note}{variable_note}{epsilon_note}Numeric values use atol={atol:g} and rtol={rtol:g}; NaN values in the same positions are treated as equal. Vdisquants moment fields include scatter plots and RMSE/R² from paired finite values.</p>
 <p class="roots"><strong>Left:</strong> {html.escape(left_label)}<br><strong>Right:</strong> {html.escape(right_label)}<br><strong>Generated:</strong> {html.escape(generated)}</p>
 <div class="cards">
 <div class="card"><span>Matched files</span><strong>{matched}</strong></div><div class="card"><span>Identical files</span><strong>{identical}</strong></div><div class="card"><span>Different files</span><strong>{different}</strong></div><div class="card"><span>Comparison errors</span><strong>{errors}</strong></div><div class="card"><span>Left-only files</span><strong>{len(left_only)}</strong></div><div class="card"><span>Right-only files</span><strong>{len(right_only)}</strong></div>
@@ -872,6 +951,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=0.0, help="absolute tolerance for numeric comparisons (default: 0)")
     parser.add_argument("--rtol", type=float, default=0.0, help="relative tolerance for numeric comparisons (default: 0)")
     parser.add_argument(
+        "--machine-epsilon", action="store_true",
+        help="treat numeric differences within one dtype-scaled machine epsilon as equal",
+    )
+    parser.add_argument(
         "--max-differences", type=int, default=1000,
         help="maximum changed positions shown per variable; use 0 to show all (default: 1000)",
     )
@@ -887,6 +970,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--match-by-date", action="store_true",
         help="pair files by their YYYYMMDD filename token instead of relative path",
     )
+    parser.add_argument(
+        "--start-date", type=dt.date.fromisoformat,
+        help="inclusive first file date in YYYY-MM-DD format",
+    )
+    parser.add_argument(
+        "--end-date", type=dt.date.fromisoformat,
+        help="inclusive final file date in YYYY-MM-DD format",
+    )
+    parser.add_argument(
+        "--left-name-contains",
+        help="use only left files whose relative path contains this text",
+    )
+    parser.add_argument(
+        "--right-name-contains",
+        help="use only right files whose relative path contains this text",
+    )
+    parser.add_argument(
+        "--exclude-date", action="append", type=dt.date.fromisoformat, default=[],
+        help="exclude an inclusive YYYY-MM-DD date; may be repeated",
+    )
     args = parser.parse_args(argv)
     if args.atol < 0 or args.rtol < 0:
         parser.error("--atol and --rtol must be non-negative")
@@ -894,6 +997,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-differences must be non-negative")
     if args.max_scatter_points < 1:
         parser.error("--max-scatter-points must be at least 1")
+    if args.start_date and args.end_date and args.start_date > args.end_date:
+        parser.error("--start-date must be on or before --end-date")
     for root in (args.left_dir, args.right_dir):
         if not root.is_dir():
             parser.error(f"directory does not exist: {root}")
@@ -910,12 +1015,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args = parse_args(argv)
     left_root, right_root = args.left_dir.resolve(), args.right_dir.resolve()
+    left_files = filter_files_by_name(
+        find_netcdf_files(left_root), args.left_name_contains
+    )
+    right_files = filter_files_by_name(
+        find_netcdf_files(right_root), args.right_name_contains
+    )
     if args.match_by_date:
-        left_files = find_netcdf_files_by_date(left_root)
-        right_files = find_netcdf_files_by_date(right_root)
-    else:
-        left_files = find_netcdf_files(left_root)
-        right_files = find_netcdf_files(right_root)
+        left_files = index_netcdf_files_by_date(left_files, left_root)
+        right_files = index_netcdf_files_by_date(right_files, right_root)
+    excluded_dates = set(args.exclude_date)
+    left_files = filter_files_by_date(
+        left_files, args.start_date, args.end_date, excluded_dates
+    )
+    right_files = filter_files_by_date(
+        right_files, args.start_date, args.end_date, excluded_dates
+    )
     shared = sorted(set(left_files) & set(right_files))
     pairs = [
         compare_pair(
@@ -927,6 +1042,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_differences,
             args.max_scatter_points,
             args.common_variables,
+            args.machine_epsilon,
         )
         for relpath in shared
     ]
@@ -940,6 +1056,10 @@ def main(argv: list[str] | None = None) -> int:
         args.rtol,
         args.match_by_date,
         args.common_variables,
+        args.start_date,
+        args.end_date,
+        args.exclude_date,
+        args.machine_epsilon,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(report, encoding="utf-8")
